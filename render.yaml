@@ -1,0 +1,106 @@
+services:
+  # Main RAGFlow Application
+  - type: web
+    name: ragflow-app
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: pro # Required for resource-intensive AI workloads
+    disk:
+      name: ragflow-storage
+      mountPath: /ragflow/logs
+      sizeGB: 20
+    envVars:
+      - key: TZ
+        value: UTC
+      - key: HF_ENDPOINT
+        value: https://hf-mirror.com
+      - key: MACOS
+        value: "0"
+      - key: RAGFLOW_IMAGE
+        value: infiniflow/ragflow:v0.19.1
+      - key: SVR_HTTP_PORT
+        value: "9380"
+      - key: MCP_ENABLED
+        value: "false"
+      # Database connection
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ragflow-db
+          property: connectionString
+      # Redis connection
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: ragflow-redis
+          property: connectionString
+      # Memory and performance settings
+      - key: MEM_LIMIT
+        value: "8g"
+      - key: TIMEZONE
+        value: UTC
+    buildCommand: |
+      # Install dependencies and prepare the application
+      pip install --no-cache-dir -r requirements.txt
+    startCommand: |
+      # Start the RAGFlow application
+      python -m api.ragflow_server
+
+  # Redis Cache
+  - type: redis
+    name: ragflow-redis
+    plan: standard
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []
+
+  # Background Worker Service (for processing tasks)
+  - type: worker
+    name: ragflow-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard
+    envVars:
+      - key: TZ
+        value: UTC
+      - key: WORKER_MODE
+        value: "true"
+      # Database connection
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ragflow-db
+          property: connectionString
+      # Redis connection
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: ragflow-redis
+          property: connectionString
+    startCommand: |
+      # Start background worker processes
+      python -m rag.svr.task_executor
+
+# PostgreSQL Database
+databases:
+  - name: ragflow-db
+    databaseName: ragflow
+    user: ragflow
+    plan: standard
+
+# Environment Groups for easier management
+envVarGroups:
+  - name: database-config
+    envVars:
+      - key: POSTGRES_DB
+        value: ragflow
+      - key: POSTGRES_USER
+        value: ragflow
+
+  - name: app-config
+    envVars:
+      - key: RAGFLOW_VERSION
+        value: "0.19.1"
+      - key: DEBUG
+        value: "false"
+      - key: PYTHONPATH
+        value: "/ragflow"
+      - key: FLASK_ENV
+        value: production
