@@ -193,3 +193,46 @@ dist
 # SvelteKit build / generate output
 .svelte-kit
 
+# Docker volume directories and deployment files
+docker/ragflow-logs/
+docker/data/
+docker/esdata01/
+docker/osdata01/
+docker/infinity_data/
+docker/mysql_data/
+docker/minio_data/
+docker/redis_data/
+
+# Docker Compose environment files (contains sensitive data)
+docker/.env
+docker/.env.*
+
+# GitHub Actions runner working directories
+actions-runner/
+_work/
+
+# GCP deployment artifacts
+deployment-logs/
+*.last-sync-commit
+
+# Backup and temporary files
+*.bak
+*.tmp
+*.swp
+*~
+
+# OS generated files
+Thumbs.db
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+

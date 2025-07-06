@@ -1,4 +1,6 @@
 name: Sync Upstream and Auto-Deploy to Render
+# Note: This workflow is specifically for Render.com deployment
+# For GCP VM deployment, use the deploy-to-gcp.yml workflow instead
 
 on:
   schedule:
