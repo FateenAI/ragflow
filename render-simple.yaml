@@ -1,0 +1,81 @@
+services:
+  # Main RAGFlow Application
+  - type: web
+    name: ragflow-app
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard-plus # Balanced performance for AI workloads
+    envVars:
+      - key: PORT
+        value: "9380"
+      - key: TZ
+        value: UTC
+      - key: HF_ENDPOINT
+        value: https://hf-mirror.com
+      - key: RAGFLOW_VERSION
+        value: "0.19.1"
+      - key: FLASK_ENV
+        value: production
+      - key: PYTHONPATH
+        value: "/ragflow"
+      # Database connection
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ragflow-db
+          property: connectionString
+      # Redis connection
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: ragflow-redis
+          property: connectionString
+      # Application configuration
+      - key: SECRET_KEY
+        generateValue: true
+      - key: JWT_SECRET_KEY
+        generateValue: true
+    healthCheckPath: /health
+    buildCommand: |
+      pip install --no-cache-dir -r requirements.txt
+    startCommand: |
+      python -m api.ragflow_server
+
+  # Background Worker Service
+  - type: worker
+    name: ragflow-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard
+    envVars:
+      - key: TZ
+        value: UTC
+      - key: WORKER_MODE
+        value: "true"
+      - key: PYTHONPATH
+        value: "/ragflow"
+      # Database connection
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ragflow-db
+          property: connectionString
+      # Redis connection
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: ragflow-redis
+          property: connectionString
+    startCommand: |
+      python -m rag.svr.task_executor
+
+  # Redis Cache
+  - type: redis
+    name: ragflow-redis
+    plan: standard
+    maxmemoryPolicy: allkeys-lru
+
+# PostgreSQL Database
+databases:
+  - name: ragflow-db
+    databaseName: ragflow
+    user: ragflow
+    plan: standard

@@ -1,0 +1,322 @@
+name: Sync Upstream and Auto-Deploy to Render
+# Note: This workflow is specifically for Render.com deployment
+# For GCP VM deployment, use the deploy-to-gcp.yml workflow instead
+
+on:
+  schedule:
+    # Run every 6 hours to check for upstream changes
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allow manual triggering
+  push:
+    branches:
+      - features/deploy-render
+
+env:
+  UPSTREAM_REPO: infiniflow/ragflow
+  DEPLOY_BRANCH: features/deploy-render
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      has-new-tag: ${{ steps.check-tags.outputs.has-new-tag }}
+      latest-tag: ${{ steps.check-tags.outputs.latest-tag }}
+      docker-changes: ${{ steps.check-docker-changes.outputs.docker-changes }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git || true
+          git remote set-url upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+
+      - name: Fetch upstream changes
+        run: |
+          git fetch upstream
+          git fetch upstream --tags
+
+      - name: Check for new tags
+        id: check-tags
+        run: |
+          # Get the latest tag from upstream
+          LATEST_UPSTREAM_TAG=$(git describe --tags --abbrev=0 upstream/main 2>/dev/null || echo "")
+          
+          # Get the latest tag in our repo
+          LATEST_LOCAL_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          echo "Latest upstream tag: $LATEST_UPSTREAM_TAG"
+          echo "Latest local tag: $LATEST_LOCAL_TAG"
+          
+          if [ "$LATEST_UPSTREAM_TAG" != "$LATEST_LOCAL_TAG" ] && [ -n "$LATEST_UPSTREAM_TAG" ]; then
+            echo "has-new-tag=true" >> $GITHUB_OUTPUT
+            echo "latest-tag=$LATEST_UPSTREAM_TAG" >> $GITHUB_OUTPUT
+            echo "New tag detected: $LATEST_UPSTREAM_TAG"
+          else
+            echo "has-new-tag=false" >> $GITHUB_OUTPUT
+            echo "latest-tag=$LATEST_LOCAL_TAG" >> $GITHUB_OUTPUT
+            echo "No new tags detected"
+          fi
+
+      - name: Merge upstream main into deploy branch
+        run: |
+          # Switch to deploy branch or create it if it doesn't exist
+          git checkout ${{ env.DEPLOY_BRANCH }} || git checkout -b ${{ env.DEPLOY_BRANCH }}
+          
+          # Merge upstream main, handling conflicts by preferring upstream changes for core files
+          # but keeping our Render-specific files
+          git merge upstream/main --no-edit || {
+            echo "Merge conflicts detected, resolving..."
+            
+            # Keep our Render configuration files
+            git checkout --ours render.yaml || true
+            git checkout --ours render-simple.yaml || true
+            git checkout --ours RENDER_DEPLOYMENT.md || true
+            git checkout --ours Dockerfile.render || true
+            git checkout --ours .github/workflows/ || true
+            
+            # Accept upstream changes for everything else
+            git add .
+            git commit -m "Merge upstream main with conflict resolution" || true
+          }
+
+      - name: Sync tags from upstream
+        if: steps.check-tags.outputs.has-new-tag == 'true'
+        run: |
+          # Fetch and push all tags from upstream
+          git tag -d $(git tag -l) 2>/dev/null || true
+          git fetch upstream --tags
+          git push origin --tags --force
+
+      - name: Check for Docker configuration changes
+        id: check-docker-changes
+        run: |
+          # Check if there are changes in Docker-related files since last sync
+          DOCKER_FILES="docker/ Dockerfile* requirements.txt pyproject.toml"
+          
+          # Get the commit hash of the last successful sync (stored in a file)
+          LAST_SYNC_COMMIT=""
+          if [ -f .last-sync-commit ]; then
+            LAST_SYNC_COMMIT=$(cat .last-sync-commit)
+          fi
+          
+          # Check for changes in Docker files
+          if [ -n "$LAST_SYNC_COMMIT" ]; then
+            if git diff --name-only $LAST_SYNC_COMMIT..HEAD | grep -E "(docker/|Dockerfile|requirements.txt|pyproject.toml)" > /dev/null; then
+              echo "docker-changes=true" >> $GITHUB_OUTPUT
+              echo "Docker configuration changes detected"
+            else
+              echo "docker-changes=false" >> $GITHUB_OUTPUT
+              echo "No Docker configuration changes"
+            fi
+          else
+            echo "docker-changes=true" >> $GITHUB_OUTPUT
+            echo "First sync, assuming Docker changes"
+          fi
+          
+          # Store current commit hash for next comparison
+          git rev-parse HEAD > .last-sync-commit
+          git add .last-sync-commit
+          git commit -m "Update last sync commit hash" || true
+
+      - name: Push changes
+        run: |
+          git push origin ${{ env.DEPLOY_BRANCH }} --force-with-lease
+
+  update-render-config:
+    needs: sync-upstream
+    if: needs.sync-upstream.outputs.has-new-tag == 'true' || needs.sync-upstream.outputs.docker-changes == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout deploy branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_BRANCH }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Update Render configuration
+        if: needs.sync-upstream.outputs.has-new-tag == 'true'
+        run: |
+          python << 'EOF'
+          import yaml
+          import re
+          
+          # Update version in render.yaml
+          def update_render_yaml(filename, new_tag):
+              try:
+                  with open(filename, 'r') as f:
+                      content = f.read()
+                  
+                  # Update RAGFLOW_IMAGE version
+                  content = re.sub(
+                      r'infiniflow/ragflow:v[\d.]+',
+                      f'infiniflow/ragflow:{new_tag}',
+                      content
+                  )
+                  
+                  # Update RAGFLOW_VERSION
+                  content = re.sub(
+                      r'value: "[v]?[\d.]+"(\s*#.*RAGFLOW_VERSION)',
+                      f'value: "{new_tag.lstrip("v")}"\\1',
+                      content
+                  )
+                  
+                  with open(filename, 'w') as f:
+                      f.write(content)
+                  
+                  print(f"Updated {filename} with version {new_tag}")
+                  return True
+              except Exception as e:
+                  print(f"Error updating {filename}: {e}")
+                  return False
+          
+          new_tag = "${{ needs.sync-upstream.outputs.latest-tag }}"
+          if new_tag:
+              update_render_yaml("render.yaml", new_tag)
+              update_render_yaml("render-simple.yaml", new_tag)
+          EOF
+
+      - name: Check for Docker configuration updates needed
+        if: needs.sync-upstream.outputs.docker-changes == 'true'
+        run: |
+          python << 'EOF'
+          import yaml
+          import os
+          
+          def check_docker_compose_changes():
+              """Check if docker-compose files have new services or configuration that should be reflected in Render"""
+              changes_needed = []
+              
+              # Check if new environment variables were added
+              compose_file = "docker/docker-compose.yml"
+              base_compose_file = "docker/docker-compose-base.yml"
+              
+              if os.path.exists(compose_file):
+                  with open(compose_file, 'r') as f:
+                      compose_content = f.read()
+                  
+                  # Look for new environment variables or services
+                  if "new environment variables detected" in compose_content.lower():
+                      changes_needed.append("New environment variables in docker-compose.yml")
+              
+              if changes_needed:
+                  print("Docker configuration changes detected:")
+                  for change in changes_needed:
+                      print(f"- {change}")
+                  
+                  # Create a comment in the PR or issue
+                  with open("docker-changes.txt", "w") as f:
+                      f.write("Docker configuration changes detected. Manual review recommended:\n")
+                      for change in changes_needed:
+                          f.write(f"- {change}\n")
+              else:
+                  print("No significant Docker configuration changes requiring Render updates")
+          
+          check_docker_compose_changes()
+          EOF
+
+      - name: Commit configuration updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if git diff --quiet; then
+            echo "No configuration changes to commit"
+          else
+            git add render.yaml render-simple.yaml
+            git commit -m "Update Render configuration for tag ${{ needs.sync-upstream.outputs.latest-tag }}"
+            git push origin ${{ env.DEPLOY_BRANCH }}
+          fi
+
+  deploy-to-render:
+    needs: [sync-upstream, update-render-config]
+    if: always() && (needs.sync-upstream.outputs.has-new-tag == 'true' || needs.sync-upstream.outputs.docker-changes == 'true')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout deploy branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_BRANCH }}
+
+      - name: Deploy to Render
+        if: ${{ secrets.RENDER_API_KEY && secrets.RENDER_SERVICE_ID }}
+        run: |
+          # Trigger Render deployment
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/deploys" \
+            -d '{
+              "clearCache": false
+            }'
+          
+          echo "Deployment triggered for Render service ${{ secrets.RENDER_SERVICE_ID }}"
+
+      - name: Create deployment summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **New Tag**: ${{ needs.sync-upstream.outputs.latest-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Docker Changes**: ${{ needs.sync-upstream.outputs.docker-changes }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ env.DEPLOY_BRANCH }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ secrets.RENDER_API_KEY }}" != "" ]; then
+            echo "- **Render Deployment**: ✅ Triggered" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Render Deployment**: ❌ Skipped (API key not configured)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  notify-on-failure:
+    needs: [sync-upstream, update-render-config, deploy-to-render]
+    if: failure()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Create issue on failure
+        if: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Automated sync and deployment failed - ${new Date().toISOString()}`;
+            const body = `
+            ## Sync and Deployment Failure
+            
+            The automated sync and deployment workflow has failed.
+            
+            **Workflow Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            **Failed Jobs**:
+            - Sync Upstream: ${{ needs.sync-upstream.result }}
+            - Update Render Config: ${{ needs.update-render-config.result }}
+            - Deploy to Render: ${{ needs.deploy-to-render.result }}
+            
+            Please investigate and resolve the issues.
+            `;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['automation', 'deployment', 'bug']
+            });

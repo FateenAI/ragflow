@@ -1,0 +1,37 @@
+# Docker volume directories (created by docker-compose)
+ragflow-logs/
+data/
+esdata01/
+osdata01/
+infinity_data/
+mysql_data/
+minio_data/
+redis_data/
+
+# Environment files with sensitive data
+.env
+.env.*
+.env.local
+.env.production
+.env.development
+
+# Backup files
+*.bak
+*.backup
+service_conf.yaml.template.bak
+
+# Temporary files
+*.tmp
+*.log
+*.pid
+
+# Docker volume mount points (if created locally)
+volumes/
+
+# Sync and deployment artifacts
+.last-sync-commit
+deployment-logs/
+
+# OS generated files
+.DS_Store
+Thumbs.db

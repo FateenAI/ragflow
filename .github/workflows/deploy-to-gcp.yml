@@ -1,0 +1,313 @@
+name: Deploy RAGFlow to GCP VM
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Allow manual triggering
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild Docker images'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  DOCKER_COMPOSE_FILE: docker/docker-compose.yml
+  DEPLOYMENT_ENV: Development
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, ragflow-gcp]
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup environment
+        run: |
+          echo "Setting up deployment environment..."
+          echo "DEPLOYMENT_TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+          echo "COMMIT_SHA=${GITHUB_SHA:0:8}" >> $GITHUB_ENV
+
+      - name: Install/Update system dependencies
+        run: |
+          # Update package lists
+          sudo apt-get update
+          
+          # Install required packages if not present
+          sudo apt-get install -y \
+            curl \
+            wget \
+            git \
+            unzip \
+            ca-certificates \
+            gnupg \
+            lsb-release \
+            htop \
+            vim
+
+      - name: Install Docker Engine
+        run: |
+          # Check if Docker is already installed
+          if ! command -v docker &> /dev/null; then
+            echo "Installing Docker Engine..."
+            
+            # Add Docker's official GPG key
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            
+            # Set up the repository
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            
+            # Install Docker Engine
+            sudo apt-get update
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            
+            # Add runner user to docker group
+            sudo usermod -aG docker $USER
+            
+            # Start and enable Docker service
+            sudo systemctl start docker
+            sudo systemctl enable docker
+          else
+            echo "Docker is already installed"
+            docker --version
+          fi
+
+      - name: Verify Docker installation
+        run: |
+          # Test Docker installation
+          sudo docker run --rm hello-world
+          
+          # Check Docker Compose
+          docker compose version
+
+      - name: Configure Docker daemon
+        run: |
+          # Create Docker daemon configuration for better performance
+          sudo mkdir -p /etc/docker
+          
+          cat << 'EOF' | sudo tee /etc/docker/daemon.json
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "storage-driver": "overlay2",
+            "storage-opts": [
+              "overlay2.override_kernel_check=true"
+            ]
+          }
+          EOF
+          
+          # Restart Docker to apply configuration
+          sudo systemctl restart docker
+          
+          # Wait for Docker to be ready
+          sleep 5
+          sudo docker info
+
+      - name: Clean up old containers and images
+        run: |
+          echo "Cleaning up Docker resources..."
+          
+          # Stop and remove existing RAGFlow containers
+          sudo docker compose -f ${{ env.DOCKER_COMPOSE_FILE }} down --remove-orphans || true
+          
+          # Remove dangling images and volumes if force rebuild is requested
+          if [ "${{ github.event.inputs.force_rebuild }}" == "true" ]; then
+            echo "Force rebuild requested - cleaning up images..."
+            sudo docker system prune -af --volumes
+          else
+            # Just clean up dangling resources
+            sudo docker system prune -f
+          fi
+
+      - name: Create required directories
+        run: |
+          # Create necessary directories for RAGFlow
+          mkdir -p docker/ragflow-logs
+          mkdir -p docker/nginx
+          
+          # Set proper permissions
+          chmod -R 755 docker/
+
+      - name: Configure environment variables
+        run: |
+          cd docker
+          
+          # Create .env file from environment variables and secrets
+          cat << 'EOF' > .env
+          # RAGFlow Configuration
+          DOC_ENGINE=${{ vars.DOC_ENGINE || 'elasticsearch' }}
+          COMPOSE_PROFILES=${{ vars.DOC_ENGINE || 'elasticsearch' }}
+          
+          # Elasticsearch Configuration
+          STACK_VERSION=${{ vars.STACK_VERSION || '8.11.3' }}
+          ES_HOST=${{ vars.ES_HOST || 'es01' }}
+          ES_PORT=${{ vars.ES_PORT || '1200' }}
+          ELASTIC_PASSWORD=${{ secrets.ELASTIC_PASSWORD || 'infini_rag_flow' }}
+          
+          # OpenSearch Configuration
+          OS_PORT=${{ vars.OS_PORT || '1201' }}
+          OS_HOST=${{ vars.OS_HOST || 'opensearch01' }}
+          OPENSEARCH_PASSWORD=${{ secrets.OPENSEARCH_PASSWORD || 'infini_rag_flow_OS_01' }}
+          
+          # Kibana Configuration
+          KIBANA_PORT=${{ vars.KIBANA_PORT || '6601' }}
+          KIBANA_USER=${{ vars.KIBANA_USER || 'rag_flow' }}
+          KIBANA_PASSWORD=${{ secrets.KIBANA_PASSWORD || 'infini_rag_flow' }}
+          
+          # Memory Configuration
+          MEM_LIMIT=${{ vars.MEM_LIMIT || '8073741824' }}
+          
+          # Infinity Configuration
+          INFINITY_HOST=${{ vars.INFINITY_HOST || 'infinity' }}
+          INFINITY_PORT=${{ vars.INFINITY_PORT || '23817' }}
+          
+          # MySQL Configuration
+          MYSQL_HOST=${{ vars.MYSQL_HOST || 'mysql' }}
+          MYSQL_PORT=${{ vars.MYSQL_PORT || '5455' }}
+          MYSQL_USER=${{ vars.MYSQL_USER || 'root' }}
+          MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD || 'infini_rag_flow' }}
+          MYSQL_DATABASE=${{ vars.MYSQL_DATABASE || 'rag_flow' }}
+          
+          # Redis Configuration
+          REDIS_HOST=${{ vars.REDIS_HOST || 'redis' }}
+          REDIS_PORT=${{ vars.REDIS_PORT || '6379' }}
+          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD || 'infini_rag_flow' }}
+          
+          # RAGFlow Service Configuration
+          RAGFLOW_IMAGE=${{ vars.RAGFLOW_IMAGE || 'infiniflow/ragflow:v0.17.0' }}
+          SVR_HTTP_PORT=${{ vars.SVR_HTTP_PORT || '9380' }}
+          TIMEZONE=${{ vars.TIMEZONE || 'Asia/Shanghai' }}
+          HF_ENDPOINT=${{ vars.HF_ENDPOINT || 'https://huggingface.co' }}
+          
+          # API Keys and Secrets
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          AZURE_OPENAI_API_KEY=${{ secrets.AZURE_OPENAI_API_KEY }}
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          
+          # Additional environment variables
+          MACOS=0
+          
+          # Deployment metadata
+          DEPLOYMENT_TIMESTAMP=${{ env.DEPLOYMENT_TIMESTAMP }}
+          COMMIT_SHA=${{ env.COMMIT_SHA }}
+          DEPLOYMENT_ENV=${{ env.DEPLOYMENT_ENV }}
+          EOF
+          
+          echo "Environment file created successfully"
+
+      - name: Pull latest Docker images
+        run: |
+          cd docker
+          
+          echo "Pulling latest Docker images..."
+          sudo docker compose -f docker-compose.yml pull
+
+      - name: Start RAGFlow services
+        run: |
+          cd docker
+          
+          echo "Starting RAGFlow services..."
+          sudo docker compose -f docker-compose.yml up -d
+          
+          echo "Waiting for services to start..."
+          sleep 30
+
+      - name: Check service health
+        run: |
+          cd docker
+          
+          echo "Checking service status..."
+          sudo docker compose -f docker-compose.yml ps
+          
+          echo "Checking service logs..."
+          sudo docker compose -f docker-compose.yml logs --tail=50
+          
+          # Wait for RAGFlow to be ready
+          echo "Waiting for RAGFlow to be ready..."
+          timeout=300
+          count=0
+          while [ $count -lt $timeout ]; do
+            if curl -f http://localhost:${{ vars.SVR_HTTP_PORT || '9380' }}/health 2>/dev/null; then
+              echo "RAGFlow is ready!"
+              break
+            fi
+            count=$((count + 10))
+            echo "Waiting... ($count/$timeout seconds)"
+            sleep 10
+          done
+          
+          if [ $count -ge $timeout ]; then
+            echo "RAGFlow failed to start within timeout"
+            exit 1
+          fi
+
+      - name: Run deployment tests
+        run: |
+          echo "Running basic deployment tests..."
+          
+          # Test main service endpoint
+          echo "Testing main service endpoint..."
+          curl -f http://localhost:${{ vars.SVR_HTTP_PORT || '9380' }}/ || echo "Main endpoint test failed"
+          
+          # Test API endpoints
+          echo "Testing API endpoints..."
+          curl -f http://localhost:${{ vars.SVR_HTTP_PORT || '9380' }}/api/v1/health || echo "API health check failed"
+
+      - name: Create deployment summary
+        if: always()
+        run: |
+          cd docker
+          
+          echo "## 🚀 RAGFlow Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployment Time**: ${{ env.DEPLOYMENT_TIMESTAMP }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA**: ${{ env.COMMIT_SHA }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ env.DEPLOYMENT_ENV }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **RAGFlow Image**: ${{ vars.RAGFLOW_IMAGE || 'infiniflow/ragflow:v0.17.0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service Port**: ${{ vars.SVR_HTTP_PORT || '9380' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Service Status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          sudo docker compose -f docker-compose.yml ps >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Service URLs" >> $GITHUB_STEP_SUMMARY
+          echo "- **RAGFlow UI**: http://$(curl -s ifconfig.me):${{ vars.SVR_HTTP_PORT || '9380' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Elasticsearch**: http://$(curl -s ifconfig.me):${{ vars.ES_PORT || '1200' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Kibana**: http://$(curl -s ifconfig.me):${{ vars.KIBANA_PORT || '6601' }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, collecting logs and cleaning up..."
+          
+          cd docker
+          
+          # Collect logs for debugging
+          mkdir -p deployment-logs
+          sudo docker compose -f docker-compose.yml logs > deployment-logs/services.log 2>&1
+          
+          # Show recent logs
+          echo "Recent service logs:"
+          sudo docker compose -f docker-compose.yml logs --tail=100
+          
+          # Stop services
+          sudo docker compose -f docker-compose.yml down --remove-orphans
